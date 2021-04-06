@@ -30,9 +30,12 @@ private:
 	GLFWwindow *m_window = nullptr;
 	int m_displayWidth;
 	int m_displayHeight;
+	int m_bufferWidth;
+	int m_bufferHeight;
 
 	GLuint m_cudaTexture;
 	struct cudaGraphicsResource *m_cudaTextureResource;
-	unsigned int *m_cudaDestResource;
+	unsigned int *m_cudaBuffer[2];
+	int m_currentBuffer = 0;
 };
 

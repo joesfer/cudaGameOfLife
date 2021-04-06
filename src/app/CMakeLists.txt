@@ -14,6 +14,7 @@ target_include_directories(sandbox PRIVATE
 
 target_link_libraries(sandbox
 	imgui
+	curand
 	)
 
 # Install

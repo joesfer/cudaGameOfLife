@@ -61,6 +61,10 @@ bool Application::initGL()
 	// TODO handle window resizing?
 	glfwGetFramebufferSize(m_window, &m_displayWidth, &m_displayHeight);
 
+	// Create a slightly lower resolution buffer to see the cells better
+	m_bufferWidth = m_displayWidth / 4;
+	m_bufferHeight = m_displayHeight / 4;
+
 	// Create texture for CUDA and GL to interop
 	// https://github.com/lxc-xx/CudaSample/blob/master/NVIDIA_CUDA-5.5_Samples/3_Imaging/simpleCUDA2GL/main.cpp
 	glGenTextures(1, &m_cudaTexture);
@@ -69,7 +73,7 @@ bool Application::initGL()
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, m_displayWidth, m_displayHeight, 0,
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, m_bufferWidth, m_bufferHeight, 0,
 	             GL_RGBA, GL_UNSIGNED_BYTE, NULL);
 
 	return true;
@@ -79,8 +83,17 @@ bool Application::initCuda()
 {
 	gpu::info();
 
-	m_cudaDestResource =
-	    static_cast<unsigned int *>(ALLOCATE(getTextureDataSize()));
+	gpu::randomiseKernelInit(m_bufferWidth * m_bufferHeight);
+	for (int i = 0; i < 2; ++i)
+	{
+		m_cudaBuffer[i] =
+		    static_cast<unsigned int *>(ALLOCATE(getTextureDataSize()));
+
+		gpu::randomiseKernelExec(m_cudaBuffer[i], m_bufferWidth,
+		                         m_bufferHeight);
+	}
+
+	gpu::randomiseKernelCleanup();
 
 	cudaGraphicsGLRegisterImage(&m_cudaTextureResource, m_cudaTexture,
 	                            GL_TEXTURE_2D,
@@ -90,16 +103,19 @@ bool Application::initCuda()
 
 void Application::compute()
 {
-	{ // run the Cuda kernel
-		// calculate grid size
-		dim3 block(16, 16, 1);
-		dim3 grid(m_displayWidth / block.x, m_displayHeight / block.y, 1);
-		// execute CUDA kernel
-		gpu::dispatchKernel(grid, block, 0, m_cudaDestResource, m_displayWidth);
+	const unsigned sourceBuffer = m_currentBuffer;
+	const unsigned destBuffer = (sourceBuffer + 1) % 2;
+	m_currentBuffer = destBuffer;
+
+	{
+		// run the Cuda kernel
+		gpu::executeGameStep(m_cudaBuffer[sourceBuffer],
+		                     m_cudaBuffer[destBuffer], m_bufferWidth,
+		                     m_bufferHeight);
 	}
 
 	{ // copy to OpenGL
-		// We want to copy m_cudaDestResource data to the texture
+		// We want to copy m_cudaBuffer data to the texture
 		// map buffer objects to get CUDA device pointers
 		cudaArray *texturePtr;
 		cudaGraphicsMapResources(1, &m_cudaTextureResource, 0);
@@ -107,22 +123,20 @@ void Application::compute()
 		                                      m_cudaTextureResource, 0, 0);
 
 		const size_t pixelSize = sizeof(GLubyte) * 4;
-		const size_t widthBytes = pixelSize * m_displayWidth;
-		const size_t srcPitchBytes = pixelSize * m_displayWidth;
-		const size_t heightRows = m_displayHeight;
-		cudaMemcpy2DToArray(texturePtr,         // dst
-		                    0,                  // wOffset
-		                    0,                  // hOffset
-		                    m_cudaDestResource, // src
-		                    srcPitchBytes,      // source picth
-		                    widthBytes,         // width
-		                    heightRows,         // height,
+		const size_t widthBytes = pixelSize * m_bufferWidth;
+		const size_t srcPitchBytes = pixelSize * m_bufferWidth;
+		const size_t heightRows = m_bufferHeight;
+		cudaMemcpy2DToArray(texturePtr,               // dst
+		                    0,                        // wOffset
+		                    0,                        // hOffset
+		                    m_cudaBuffer[destBuffer], // src
+		                    srcPitchBytes,            // source picth
+		                    widthBytes,               // width
+		                    heightRows,               // height,
 		                    cudaMemcpyDefault);
 
 		cudaGraphicsUnmapResources(1, &m_cudaTextureResource, 0);
 	}
-
-	cudaDeviceSynchronize();
 }
 
 void Application::drawFrame()
@@ -143,7 +157,7 @@ void Application::drawFrame()
 	}
 
 	// Rendering
-	ImGui::Render();
+
 	glViewport(0, 0, m_displayWidth, m_displayHeight);
 	glClear(GL_COLOR_BUFFER_BIT);
 
@@ -179,6 +193,8 @@ void Application::drawFrame()
 		glDisable(GL_TEXTURE_2D);
 	}
 
+	ImGui::Render();
+
 	ImGui_ImplOpenGL2_RenderDrawData(ImGui::GetDrawData());
 
 	glfwMakeContextCurrent(m_window);
@@ -187,7 +203,10 @@ void Application::drawFrame()
 
 void Application::cleanupCuda()
 {
-	FREE(m_cudaDestResource);
+	for (int i = 0; i < 2; ++i)
+	{
+		FREE(m_cudaBuffer[i]);
+	}
 	cudaDeviceReset();
 }
 
@@ -199,7 +218,7 @@ void Application::cleanupGL()
 
 size_t Application::getTextureDataSize() const
 {
-	int numTexels = m_displayWidth * m_displayHeight;
+	int numTexels = m_bufferWidth * m_bufferHeight;
 	int numValues = numTexels * 4;
 	int texDataBytes = sizeof(GLubyte) * numValues;
 	return texDataBytes;

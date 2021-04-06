@@ -1,20 +1,92 @@
 #include "kernel.h"
 
+#include <curand.h>
+#include <random>
+
 namespace
 {
-// clamp x to range [a, b]
-__device__ float clamp(float x, float a, float b) { return max(a, min(b, x)); }
+__device__ bool floatToBool(float f) { return f > 0.5f; }
 
-// convert floating point rgb color to 8-bit integer
-__device__ int rgbToInt(float r, float g, float b)
+__device__ void toggle(unsigned int *state, int index, bool value)
 {
-	r = clamp(r, 0.0f, 255.0f);
-	g = clamp(g, 0.0f, 255.0f);
-	b = clamp(b, 0.0f, 255.0f);
-	return (int(b) << 16) | (int(g) << 8) | int(r);
+	const unsigned char c = value ? 255 : 0;
+	state[index] = c << 24 | c << 16 | c << 8 | c;
 }
 
-__global__ void cudaProcess(unsigned int *data, int arrayWidth)
+__device__ bool isToggled(const unsigned int *state, int x, int y, int width,
+                          int height)
+{
+	// wrap coordinates around
+	x = (x + width) % width;
+	y = (y + height) % height;
+	return state[y * width + x] != 0;
+}
+
+__device__ int countNeightbours(const unsigned int *state, int x, int y,
+                                int width, int height)
+{
+	// clang-format off
+	static int offsets[8][2] = {{-1, -1}, {0, -1}, {1, -1},
+	                            {-1,  0},          {1,  0},
+	                            {-1, +1}, {0, +1}, {1, +1}};
+	// clang-format on
+	int n = 0;
+	for (int i = 0; i < 8; ++i)
+	{
+		if (isToggled(state, x + offsets[i][0], y + offsets[i][1], width,
+		              height))
+		{
+			n++;
+		}
+	}
+	return n;
+}
+
+__global__ void gameOfLifeKernel(const unsigned int *inputState,
+                                 unsigned int *outputState, int arrayWidth,
+                                 int arrayHeight)
+{
+	int tx = threadIdx.x;
+	int ty = threadIdx.y;
+	int bw = blockDim.x;
+	int bh = blockDim.y;
+	int x = blockIdx.x * bw + tx;
+	int y = blockIdx.y * bh + ty;
+	const int index = y * arrayWidth + x;
+
+	https://en.wikipedia.org/wiki/Conway%27s_Game_of_Life
+
+	bool alive = isToggled(inputState, x, y, arrayWidth, arrayHeight);
+	int n = countNeightbours(inputState, x, y, arrayWidth, arrayHeight);
+
+	// Any live cell with two or three live neighbours survives.
+	if (alive && (n == 2 || n == 3))
+	{
+		toggle(outputState, index, true);
+	}
+	// Any dead cell with three live neighbours becomes a live cell.
+	else if (!alive && n == 3)
+	{
+		toggle(outputState, index, true);
+	}
+	// All other live cells die in the next generation. Similarly, all other
+	// dead cells stay dead.
+	else
+	{
+		toggle(outputState, index, false);
+	}
+}
+
+namespace random
+{
+unsigned numRandomNumbers = 0;
+float *deviceRandomNumbers = nullptr;
+curandGenerator_t rngGenerator;
+} // namespace random
+
+__global__ void randomiseValuesKernel(const float *random, int numRandom,
+                                      int shuffle, unsigned int *dest,
+                                      int arrayWidth)
 {
 	int tx = threadIdx.x;
 	int ty = threadIdx.y;
@@ -23,8 +95,9 @@ __global__ void cudaProcess(unsigned int *data, int arrayWidth)
 	int x = blockIdx.x * bw + tx;
 	int y = blockIdx.y * bh + ty;
 
-	uchar4 c4 = make_uchar4((x & 0x20) ? 100 : 0, 0, (y & 0x20) ? 100 : 0, 0);
-	data[y * arrayWidth + x] = rgbToInt(c4.z, c4.y, c4.x);
+	int index = y * arrayWidth + x;
+	const float f = random[(index + shuffle) % numRandom];
+	toggle(dest, index, floatToBool(f));
 }
 
 } // namespace
@@ -32,10 +105,65 @@ __global__ void cudaProcess(unsigned int *data, int arrayWidth)
 namespace gpu
 {
 
-extern "C" void dispatchKernel(dim3 grid, dim3 block, int sbytes,
-                               unsigned int *data, int arrayWidth)
+extern "C" void randomiseKernelInit(int totalRandomNumbers)
 {
-	cudaProcess<<<grid, block, sbytes>>>(data, arrayWidth);
+	using namespace random;
+
+	randomiseKernelCleanup();
+	numRandomNumbers = totalRandomNumbers;
+	cudaMalloc((void **)&deviceRandomNumbers, numRandomNumbers * sizeof(float));
+	curandCreateGenerator(&rngGenerator, CURAND_RNG_PSEUDO_DEFAULT);
+	curandSetPseudoRandomGeneratorSeed(rngGenerator, 1234ULL);
+	curandGenerateUniform(rngGenerator, deviceRandomNumbers, numRandomNumbers);
+}
+
+extern "C" void randomiseKernelExec(unsigned int *data, int width, int height)
+{
+	using namespace random;
+
+	const int sharedMemoryBytes = 0;
+
+	// calculate grid size
+	dim3 block(16, 16, 1);
+	dim3 grid(width / block.x, height / block.y, 1);
+
+	int shuffle = rand();
+
+	// execute CUDA kernel
+	randomiseValuesKernel<<<grid, block, sharedMemoryBytes>>>(
+	    deviceRandomNumbers, numRandomNumbers, shuffle, data, width);
+
+	cudaDeviceSynchronize();
+}
+
+extern "C" void randomiseKernelCleanup()
+{
+	using namespace random;
+
+	if (deviceRandomNumbers != nullptr)
+	{
+		cudaFree(deviceRandomNumbers);
+		deviceRandomNumbers = nullptr;
+
+		curandDestroyGenerator(rngGenerator);
+	}
+}
+
+extern "C" void executeGameStep(const unsigned int *inputState,
+                                unsigned int *outputState, int width,
+                                int height)
+{
+	const int sharedMemoryBytes = 0;
+
+	// calculate grid size
+	dim3 block(16, 16, 1);
+	dim3 grid(width / block.x, height / block.y, 1);
+
+	// execute CUDA kernel
+	gameOfLifeKernel<<<grid, block, sharedMemoryBytes>>>(
+	    inputState, outputState, width, height);
+
+	cudaDeviceSynchronize();
 }
 
 } // namespace gpu
